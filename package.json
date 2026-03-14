@@ -1,0 +1,46 @@
+{
+  "name": "@prsm/queue",
+  "version": "2.0.0",
+  "description": "Redis-backed distributed task queue with grouped concurrency, retries, and rate limiting",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "types": "./types/index.d.ts",
+  "files": [
+    "src",
+    "types"
+  ],
+  "scripts": {
+    "test": "vitest --reporter=verbose --run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npx tsc --declaration --allowJs --emitDeclarationOnly --skipLibCheck --target es2020 --module nodenext --moduleResolution nodenext --strict false --esModuleInterop true --outDir ./types src/index.js"
+  },
+  "keywords": [
+    "queue",
+    "redis",
+    "distributed",
+    "task",
+    "job",
+    "worker",
+    "rate-limit",
+    "concurrency",
+    "retry"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@prsm/ms": "^1.0.1",
+    "redis": "^5.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
