@@ -20,7 +20,7 @@ import ms from "@prsm/ms"
  * @property {string} uuid
  * @property {any} payload
  * @property {number} createdAt
- * @property {string} [groupKey]
+ * @property {string} [group]
  * @property {number} attempts
  */
 
@@ -157,7 +157,7 @@ export default class Queue extends EventEmitter {
   async push(payload, { group } = {}) {
     if (this._closed) throw new Error("Queue is closed")
     const task = group
-      ? { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: group, attempts: 0 }
+      ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
     this._pushed++
     try {
@@ -178,7 +178,7 @@ export default class Queue extends EventEmitter {
   pushAndWait(payload, { group, timeout = 0 } = {}) {
     if (this._closed) return Promise.reject(new Error("Queue is closed"))
     const task = group
-      ? { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: group, attempts: 0 }
+      ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
     this._pushed++
     const result = this._awaitTask(task.uuid, timeout)
@@ -338,13 +338,13 @@ export default class Queue extends EventEmitter {
       timeout: this._options.groups.timeout,
       maxRetries: this._options.groups.maxRetries,
       retryKey: `queue:groups:${groupKey}`,
-      groupKey,
+      group: groupKey,
     }
     this._runWorkerLoop(workerId, client, `queue:groups:${groupKey}`, groupWorkers, opts)
   }
 
   async _runWorkerLoop(workerId, client, key, activeMap, opts) {
-    const delay = opts.groupKey ? this._options.groups.delay : this._options.delay
+    const delay = opts.group ? this._options.groups.delay : this._options.delay
 
     while (activeMap.get(workerId)) {
       try {
@@ -371,17 +371,17 @@ export default class Queue extends EventEmitter {
           }
 
           this._inFlight++
-          if (opts.groupKey) {
-            this._groupInFlight.set(opts.groupKey, (this._groupInFlight.get(opts.groupKey) || 0) + 1)
+          if (opts.group) {
+            this._groupInFlight.set(opts.group, (this._groupInFlight.get(opts.group) || 0) + 1)
           }
 
           try {
             await this._processTask(task, opts)
           } finally {
-            if (opts.groupKey) {
-              const count = (this._groupInFlight.get(opts.groupKey) || 1) - 1
-              if (count <= 0) this._groupInFlight.delete(opts.groupKey)
-              else this._groupInFlight.set(opts.groupKey, count)
+            if (opts.group) {
+              const count = (this._groupInFlight.get(opts.group) || 1) - 1
+              if (count <= 0) this._groupInFlight.delete(opts.group)
+              else this._groupInFlight.set(opts.group, count)
             }
             if (leaseId) await this._releaseGlobal(leaseId).catch(() => {})
           }

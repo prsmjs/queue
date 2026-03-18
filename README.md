@@ -147,7 +147,7 @@ queue.on('drain', () => {})
   uuid: string,
   payload: any,
   createdAt: number,
-  groupKey?: string,  // present when pushed with { group }
+  group?: string,     // present when pushed with { group }
   attempts: number
 }
 ```

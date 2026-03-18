@@ -179,7 +179,7 @@ describe("Queue", () => {
   })
 
   describe("grouped queues", () => {
-    it("should create grouped tasks with groupKey", async () => {
+    it("should create grouped tasks with group", async () => {
       queue = new Queue()
       await queue.ready()
 
@@ -188,7 +188,7 @@ describe("Queue", () => {
       const { task } = await newPromise
 
       expect(uuid).toBeDefined()
-      expect(task.groupKey).toBe("test-group")
+      expect(task.group).toBe("test-group")
       expect(task.payload).toEqual({ message: "grouped test" })
     })
 
@@ -219,7 +219,7 @@ describe("Queue", () => {
       const { task } = await failedPromise
 
       expect(attempts).toBe(2)
-      expect(task.groupKey).toBe("retry-group")
+      expect(task.group).toBe("retry-group")
     })
 
     it("should process different groups concurrently", async () => {
