@@ -866,6 +866,92 @@ describe("Queue", () => {
     })
   })
 
+  describe("pushAndWait", () => {
+    it("should resolve with the handler result", async () => {
+      queue = new Queue({ concurrency: 1 })
+      queue.process(async (payload) => ({ echo: payload.message }))
+      await queue.ready()
+
+      const result = await queue.pushAndWait({ message: "hello" })
+      expect(result).toEqual({ echo: "hello" })
+    })
+
+    it("should reject when the task fails", async () => {
+      queue = new Queue({ concurrency: 1, maxRetries: 1 })
+      queue.process(async () => { throw new Error("boom") })
+      await queue.ready()
+
+      await expect(queue.pushAndWait({ id: 1 })).rejects.toThrow("boom")
+    })
+
+    it("should reject on timeout", async () => {
+      queue = new Queue({ concurrency: 1 })
+      queue.process(async () => new Promise((r) => setTimeout(r, 5000)))
+      await queue.ready()
+
+      await expect(queue.pushAndWait({ id: 1 }, 50)).rejects.toThrow("pushAndWait timed out")
+    })
+
+    it("should accept duration strings for timeout", async () => {
+      queue = new Queue({ concurrency: 1 })
+      queue.process(async () => new Promise((r) => setTimeout(r, 5000)))
+      await queue.ready()
+
+      await expect(queue.pushAndWait({ id: 1 }, "50ms")).rejects.toThrow("pushAndWait timed out")
+    })
+
+    it("should resolve the correct task when multiple are in flight", async () => {
+      queue = new Queue({ concurrency: 3 })
+      queue.process(async (payload) => {
+        await new Promise((r) => setTimeout(r, 50))
+        return payload.id * 10
+      })
+      await queue.ready()
+
+      const results = await Promise.all([
+        queue.pushAndWait({ id: 1 }),
+        queue.pushAndWait({ id: 2 }),
+        queue.pushAndWait({ id: 3 }),
+      ])
+
+      expect(results).toContain(10)
+      expect(results).toContain(20)
+      expect(results).toContain(30)
+    })
+
+    it("should work with grouped queues", async () => {
+      queue = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      queue.process(async (payload) => `processed-${payload.id}`)
+      await queue.ready()
+
+      const result = await queue.group("tenant-1").pushAndWait({ id: "a" })
+      expect(result).toBe("processed-a")
+    })
+
+    it("should reject for grouped tasks that fail", async () => {
+      queue = new Queue({ concurrency: 1, groups: { concurrency: 1, maxRetries: 1 }, cleanupInterval: 0 })
+      queue.process(async () => { throw new Error("group boom") })
+      await queue.ready()
+
+      await expect(queue.group("g1").pushAndWait({ id: 1 })).rejects.toThrow("group boom")
+    })
+
+    it("should resolve after retries succeed", async () => {
+      let attempts = 0
+      queue = new Queue({ concurrency: 1, maxRetries: 3 })
+      queue.process(async () => {
+        attempts++
+        if (attempts < 3) throw new Error("not yet")
+        return "finally"
+      })
+      await queue.ready()
+
+      const result = await queue.pushAndWait({ id: 1 })
+      expect(result).toBe("finally")
+      expect(attempts).toBe(3)
+    })
+  })
+
   describe("groups.concurrency defaults", () => {
     it("should default groups.concurrency to 1 regardless of main concurrency", async () => {
       queue = new Queue({ concurrency: 5, cleanupInterval: 0 })

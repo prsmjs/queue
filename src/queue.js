@@ -156,32 +156,113 @@ export default class Queue extends EventEmitter {
   async push(payload) {
     if (this._closed) throw new Error("Queue is closed")
     const task = { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
-    await this._redis.lPush("queue:tasks", JSON.stringify(task))
     this._pushed++
+    try {
+      await this._redis.lPush("queue:tasks", JSON.stringify(task))
+    } catch (err) {
+      this._pushed--
+      throw err
+    }
     this.emit("new", { task })
     return task.uuid
   }
 
   /**
+   * @param {any} payload
+   * @param {number|string} [timeout] - max time to wait for result, ms or string like "30s" (default 0, no limit)
+   * @returns {Promise<any>}
+   */
+  pushAndWait(payload, timeout = 0) {
+    if (this._closed) return Promise.reject(new Error("Queue is closed"))
+    const task = { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
+    this._pushed++
+    const result = this._awaitTask(task.uuid, timeout)
+    result.catch(() => {})
+    return this._redis.lPush("queue:tasks", JSON.stringify(task)).then(() => {
+      this.emit("new", { task })
+      return result
+    }, (err) => {
+      this._pushed--
+      throw err
+    })
+  }
+
+  /**
    * @param {string} key
-   * @returns {{ push: (payload: any) => Promise<string> }}
+   * @returns {{ push: (payload: any) => Promise<string>, pushAndWait: (payload: any, timeout?: number|string) => Promise<any> }}
    */
   group(key) {
-    return {
-      push: async (payload) => {
-        if (this._closed) throw new Error("Queue is closed")
-        const task = { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: key, attempts: 0 }
-        await this._redis.lPush(`queue:groups:${key}`, JSON.stringify(task))
-        this._pushed++
+    const makeTask = (payload) => {
+      if (this._closed) throw new Error("Queue is closed")
+      return { uuid: randomUUID(), payload, createdAt: Date.now(), groupKey: key, attempts: 0 }
+    }
+
+    const commit = (task) => {
+      return this._redis.lPush(`queue:groups:${key}`, JSON.stringify(task)).then(async () => {
         this.emit("new", { task })
         if (!this._groupWorkers.has(key)) {
           this._groupWorkers.set(key, new Map())
           this._groupInFlight.set(key, 0)
           await this._startGroupWorkers(key)
         }
+      }, (err) => {
+        this._pushed--
+        throw err
+      })
+    }
+
+    return {
+      push: async (payload) => {
+        const task = makeTask(payload)
+        this._pushed++
+        await commit(task)
         return task.uuid
       },
+      pushAndWait: (payload, timeout = 0) => {
+        const task = makeTask(payload)
+        this._pushed++
+        const result = this._awaitTask(task.uuid, timeout)
+        result.catch(() => {})
+        return commit(task).then(() => result)
+      },
     }
+  }
+
+  /** @private */
+  _awaitTask(uuid, timeout = 0) {
+    const ms_ = ms(timeout)
+    return new Promise((resolve, reject) => {
+      let timer
+
+      const onComplete = ({ task, result }) => {
+        if (task.uuid !== uuid) return
+        cleanup()
+        resolve(result)
+      }
+
+      const onFailed = ({ task, error }) => {
+        if (task.uuid !== uuid) return
+        cleanup()
+        reject(error)
+      }
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer)
+        this.off("complete", onComplete)
+        this.off("failed", onFailed)
+      }
+
+      if (ms_ > 0) {
+        timer = setTimeout(() => {
+          cleanup()
+          reject(new Error("pushAndWait timed out"))
+        }, ms_)
+        timer.unref?.()
+      }
+
+      this.on("complete", onComplete)
+      this.on("failed", onFailed)
+    })
   }
 
   /** @returns {Promise<void>} */
@@ -190,6 +271,7 @@ export default class Queue extends EventEmitter {
     await this._readyPromise.catch(() => {})
 
     if (this._cleanupTimer) clearInterval(this._cleanupTimer)
+    clearTimeout(this._drainTimer)
 
     this._workers.clear()
     for (const groupWorkers of this._groupWorkers.values()) groupWorkers.clear()
@@ -433,7 +515,10 @@ export default class Queue extends EventEmitter {
   }
 
   _emitDrain() {
-    if (this._inFlight === 0 && this._totalSettled >= this._pushed) this.emit("drain")
+    clearTimeout(this._drainTimer)
+    this._drainTimer = setTimeout(() => {
+      if (this._inFlight === 0 && this._totalSettled >= this._pushed) this.emit("drain")
+    }, 0)
   }
 
   async _periodicCleanup() {
