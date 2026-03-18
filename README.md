@@ -176,11 +176,48 @@ app.post('/api/generate', async (req, res) => {
 
 Each tenant gets up to 2 concurrent LLM calls with a 50ms pause between them. Total concurrent calls across all tenants is capped at 20, protecting your server and API budget from any single tenant overwhelming the system.
 
-## WebSocket Integration with [mesh](https://github.com/nvms/mesh)
+## Fan-out with Groups
+
+Use groups to fan out a single event to multiple independent handlers. Each group processes and retries independently.
+
+```js
+const queue = new Queue({
+  concurrency: 10,
+  groups: { concurrency: 1 },
+})
+
+const handlers = {
+  "email": {
+    "user:created": (data) => sendWelcomeEmail(data.email),
+    "user:deleted": (data) => sendGoodbyeEmail(data.email),
+  },
+  "workspace": {
+    "user:created": (data) => createDefaultWorkspace(data.userId),
+  },
+  "slack": {
+    "user:created": (data) => notifySlack(`new user: ${data.email}`),
+  },
+}
+
+queue.process(async ({ event, data }, task) => {
+  await handlers[task.group]?.[event]?.(data)
+})
+
+await queue.ready()
+
+// emit to all groups
+await Promise.all(
+  Object.keys(handlers).map((group) =>
+    queue.push({ event: "user:created", data: { userId: "u1", email: "a@b.com" } }, { group })
+  )
+)
+```
+
+The `handlers` object is both the registry and the routing logic. Adding a new subscriber is adding a key.
+
+## WebSocket Integration
 
 Queue events are local-only - only the server that processes a task emits `complete`/`failed`. Use [@prsm/realtime](https://github.com/nvms/realtime) to push results to connected clients in real time.
-
-Send results to a specific client:
 
 ```js
 import Queue from '@prsm/queue'
@@ -213,7 +250,7 @@ await queue.ready()
 await realtime.listen(8080)
 ```
 
-Both queue and realtime use the same Redis instance. No key conflicts (`queue:*` vs `mesh:*`).
+Both queue and realtime use the same Redis instance. No key conflicts (`queue:*` vs `rt:*`).
 
 ## Horizontal Scaling
 
