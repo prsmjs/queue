@@ -133,7 +133,6 @@ export default class Queue extends EventEmitter {
     this._redis.on("error", () => {})
     this._subClient = null
     this._groupNotifyClient = null
-    this._pendingWaits = new Map()
     this._readyPromise = this._initialize()
   }
 
@@ -257,7 +256,6 @@ export default class Queue extends EventEmitter {
         if (timer) clearTimeout(timer)
         this.off("complete", onComplete)
         this.off("failed", onFailed)
-        this._pendingWaits.delete(uuid)
         this._subClient?.unsubscribe(channel).catch(() => {})
       }
 
@@ -268,8 +266,6 @@ export default class Queue extends EventEmitter {
 
       this.on("complete", onComplete)
       this.on("failed", onFailed)
-
-      this._pendingWaits.set(uuid, true)
 
       this._ensureSubClient().then((sub) => {
         if (settled) { resolveReady(); return }
@@ -592,6 +588,7 @@ export default class Queue extends EventEmitter {
         }
         this._groupInFlight.delete(groupKey)
       }
+      this._workerClients = this._workerClients.filter((c) => c.isOpen)
     } catch {}
   }
 }

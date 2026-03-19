@@ -887,7 +887,7 @@ describe("Queue", () => {
 
     it("should reject on timeout", async () => {
       queue = new Queue({ concurrency: 1 })
-      queue.process(async () => new Promise((r) => setTimeout(r, 5000)))
+      queue.process(async () => new Promise((r) => setTimeout(r, 500)))
       await queue.ready()
 
       await expect(queue.pushAndWait({ id: 1 }, { timeout: 50 })).rejects.toThrow("pushAndWait timed out")
@@ -895,7 +895,7 @@ describe("Queue", () => {
 
     it("should accept duration strings for timeout", async () => {
       queue = new Queue({ concurrency: 1 })
-      queue.process(async () => new Promise((r) => setTimeout(r, 5000)))
+      queue.process(async () => new Promise((r) => setTimeout(r, 500)))
       await queue.ready()
 
       await expect(queue.pushAndWait({ id: 1 }, { timeout: "50ms" })).rejects.toThrow("pushAndWait timed out")
@@ -1040,7 +1040,7 @@ describe("Queue", () => {
 
       const worker = new Queue({ concurrency: 1 })
       extraQueues.push(worker)
-      worker.process(async () => new Promise((r) => setTimeout(r, 5000)))
+      worker.process(async () => new Promise((r) => setTimeout(r, 500)))
       await worker.ready()
 
       await expect(queue.pushAndWait({ id: 1 }, { timeout: 50 })).rejects.toThrow("pushAndWait timed out")
@@ -1132,6 +1132,77 @@ describe("Queue", () => {
       await allDone
 
       expect(maxRunning).toBe(1)
+    })
+  })
+
+  describe("delay", () => {
+    it("should pause between tasks", async () => {
+      queue = new Queue({ concurrency: 1, delay: 100 })
+
+      const timestamps = []
+      queue.process(async () => { timestamps.push(Date.now()) })
+
+      const allDone = waitForN(queue, "complete", 3)
+      await queue.ready()
+      await queue.push({ id: 1 })
+      await queue.push({ id: 2 })
+      await queue.push({ id: 3 })
+      await allDone
+
+      for (let i = 1; i < timestamps.length; i++) {
+        expect(timestamps[i] - timestamps[i - 1]).toBeGreaterThanOrEqual(80)
+      }
+    })
+
+    it("should use group-specific delay for grouped tasks", async () => {
+      queue = new Queue({ concurrency: 1, groups: { concurrency: 1, delay: 100 }, cleanupInterval: 0 })
+
+      const timestamps = []
+      queue.process(async () => { timestamps.push(Date.now()) })
+
+      const allDone = waitForN(queue, "complete", 3)
+      await queue.ready()
+      await queue.push({ id: 1 }, { group: "g1" })
+      await queue.push({ id: 2 }, { group: "g1" })
+      await queue.push({ id: 3 }, { group: "g1" })
+      await allDone
+
+      for (let i = 1; i < timestamps.length; i++) {
+        expect(timestamps[i] - timestamps[i - 1]).toBeGreaterThanOrEqual(80)
+      }
+    })
+  })
+
+  describe("handler metadata", () => {
+    it("should pass task metadata as second argument to handler", async () => {
+      queue = new Queue({ concurrency: 1 })
+
+      let receivedTask
+      queue.process(async (payload, task) => {
+        receivedTask = task
+        return "done"
+      })
+
+      await queue.ready()
+      const uuid = await queue.push({ msg: "hello" }, { group: "g1" })
+      await waitForEvent(queue, "complete")
+
+      expect(receivedTask.uuid).toBe(uuid)
+      expect(receivedTask.payload).toEqual({ msg: "hello" })
+      expect(receivedTask.group).toBe("g1")
+      expect(receivedTask.attempts).toBe(1)
+      expect(typeof receivedTask.createdAt).toBe("number")
+    })
+  })
+
+  describe("pushAndWait after close", () => {
+    it("should reject pushAndWait after close", async () => {
+      queue = new Queue()
+      await queue.ready()
+      await queue.close()
+
+      await expect(queue.pushAndWait({ id: 1 })).rejects.toThrow("Queue is closed")
+      queue = null
     })
   })
 })
