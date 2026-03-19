@@ -131,6 +131,9 @@ export default class Queue extends EventEmitter {
 
     this._redis = createClient(this._options.redisOptions)
     this._redis.on("error", () => {})
+    this._subClient = null
+    this._groupNotifyClient = null
+    this._pendingWaits = new Map()
     this._readyPromise = this._initialize()
   }
 
@@ -175,72 +178,112 @@ export default class Queue extends EventEmitter {
    * @param {{ group?: string, timeout?: number|string }} [options]
    * @returns {Promise<any>}
    */
-  pushAndWait(payload, { group, timeout = 0 } = {}) {
-    if (this._closed) return Promise.reject(new Error("Queue is closed"))
+  async pushAndWait(payload, { group, timeout = 0 } = {}) {
+    if (this._closed) throw new Error("Queue is closed")
     const task = group
       ? { uuid: randomUUID(), payload, createdAt: Date.now(), group, attempts: 0 }
       : { uuid: randomUUID(), payload, createdAt: Date.now(), attempts: 0 }
     this._pushed++
-    const result = this._awaitTask(task.uuid, timeout)
-    result.catch(() => {})
-    return this._enqueue(task, group).then(() => {
-      this.emit("new", { task })
-      return result
-    }, (err) => {
+    const { promise, ready } = this._awaitTask(task.uuid, timeout)
+    promise.catch(() => {})
+    await ready
+    try {
+      await this._enqueue(task, group)
+    } catch (err) {
       this._pushed--
       throw err
-    })
+    }
+    this.emit("new", { task })
+    return promise
   }
 
   /** @private */
   async _enqueue(task, group) {
     if (group) {
       await this._redis.lPush(`queue:groups:${group}`, JSON.stringify(task))
-      if (!this._groupWorkers.has(group)) {
-        this._groupWorkers.set(group, new Map())
-        this._groupInFlight.set(group, 0)
-        await this._startGroupWorkers(group)
-      }
+      await this._ensureGroupWorkers(group)
+      this._redis.publish("queue:group:notify", group).catch(() => {})
     } else {
       await this._redis.lPush("queue:tasks", JSON.stringify(task))
     }
   }
 
   /** @private */
+  async _ensureGroupWorkers(group) {
+    if (this._groupWorkers.has(group) || this._closed || this._options.concurrency === 0) return
+    this._groupWorkers.set(group, new Map())
+    this._groupInFlight.set(group, 0)
+    await this._startGroupWorkers(group)
+  }
+
+  /** @private */
+  async _ensureSubClient() {
+    if (this._subClient) return this._subClient
+    this._subClient = this._redis.duplicate()
+    this._subClient.on("error", () => {})
+    await this._subClient.connect()
+    return this._subClient
+  }
+
+  /** @private */
   _awaitTask(uuid, timeout = 0) {
     const ms_ = ms(timeout)
-    return new Promise((resolve, reject) => {
+    const channel = `queue:result:${uuid}`
+    let resolveReady
+
+    const ready = new Promise((r) => { resolveReady = r })
+
+    const promise = new Promise((resolve, reject) => {
       let timer
+      let settled = false
 
-      const onComplete = ({ task, result }) => {
-        if (task.uuid !== uuid) return
+      const settle = (fn, value) => {
+        if (settled) return
+        settled = true
         cleanup()
-        resolve(result)
+        fn(value)
       }
 
-      const onFailed = ({ task, error }) => {
+      const onLocal = (event) => ({ task, result, error }) => {
         if (task.uuid !== uuid) return
-        cleanup()
-        reject(error)
+        if (event === "complete") settle(resolve, result)
+        else settle(reject, error)
       }
+
+      const onComplete = onLocal("complete")
+      const onFailed = onLocal("failed")
 
       const cleanup = () => {
         if (timer) clearTimeout(timer)
         this.off("complete", onComplete)
         this.off("failed", onFailed)
+        this._pendingWaits.delete(uuid)
+        this._subClient?.unsubscribe(channel).catch(() => {})
       }
 
       if (ms_ > 0) {
-        timer = setTimeout(() => {
-          cleanup()
-          reject(new Error("pushAndWait timed out"))
-        }, ms_)
+        timer = setTimeout(() => settle(reject, new Error("pushAndWait timed out")), ms_)
         timer.unref?.()
       }
 
       this.on("complete", onComplete)
       this.on("failed", onFailed)
+
+      this._pendingWaits.set(uuid, true)
+
+      this._ensureSubClient().then((sub) => {
+        if (settled) { resolveReady(); return }
+        sub.subscribe(channel, (message) => {
+          try {
+            const { status, result, error } = JSON.parse(message)
+            if (status === "complete") settle(resolve, result)
+            else settle(reject, error ? Object.assign(new Error(error.message), error) : new Error("Task failed"))
+          } catch {}
+        }).then(() => resolveReady()).catch(() => resolveReady())
+      }).catch(() => resolveReady())
     })
+
+    return { promise, ready }
   }
 
   /** @returns {Promise<void>} */
@@ -281,15 +324,41 @@ export default class Queue extends EventEmitter {
       if (client.isOpen) await client.disconnect()
     }
     this._workerClients = []
+    if (this._groupNotifyClient?.isOpen) await this._groupNotifyClient.unsubscribe().catch(() => {})
+    if (this._groupNotifyClient?.isOpen) await this._groupNotifyClient.disconnect().catch(() => {})
+    this._groupNotifyClient = null
+    if (this._subClient?.isOpen) await this._subClient.disconnect().catch(() => {})
+    this._subClient = null
     if (this._redis.isOpen) await this._redis.quit()
   }
 
   async _initialize() {
     await this._redis.connect()
     await this._startWorkers()
+    if (this._options.concurrency > 0) {
+      await this._subscribeToGroupNotifications()
+      await this._discoverExistingGroups()
+    }
     if (this._options.cleanupInterval > 0) {
       this._cleanupTimer = setInterval(() => this._periodicCleanup(), this._options.cleanupInterval)
       this._cleanupTimer.unref()
+    }
+  }
+
+  async _subscribeToGroupNotifications() {
+    this._groupNotifyClient = this._redis.duplicate()
+    this._groupNotifyClient.on("error", () => {})
+    await this._groupNotifyClient.connect()
+    await this._groupNotifyClient.subscribe("queue:group:notify", (group) => {
+      this._ensureGroupWorkers(group)
+    })
+  }
+
+  async _discoverExistingGroups() {
+    const keys = await this._redis.keys("queue:groups:*")
+    for (const key of keys) {
+      const group = key.slice("queue:groups:".length)
+      await this._ensureGroupWorkers(group)
     }
   }
 
@@ -467,6 +536,7 @@ export default class Queue extends EventEmitter {
 
     if (succeeded) {
       this._settle()
+      this._publishResult(task.uuid, { status: "complete", result })
       try { this.emit("complete", { task, result }) } finally { this._emitDrain() }
     } else if (task.attempts < opts.maxRetries && !this._closed) {
       let retried = false
@@ -479,12 +549,20 @@ export default class Queue extends EventEmitter {
         this.emit("retry", { task, error: handlerError, attempt: task.attempts })
       } else {
         this._settle()
+        this._publishResult(task.uuid, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
         try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
       }
     } else {
       this._settle()
+      this._publishResult(task.uuid, { status: "failed", error: { message: handlerError?.message, code: handlerError?.code, name: handlerError?.name } })
       try { this.emit("failed", { task, error: handlerError }) } finally { this._emitDrain() }
     }
+  }
+
+  _publishResult(uuid, payload) {
+    if (!this._redis.isOpen) return
+    const channel = `queue:result:${uuid}`
+    this._redis.publish(channel, JSON.stringify(payload)).catch(() => {})
   }
 
   _settle() {

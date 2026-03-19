@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest"
+import { randomUUID } from "crypto"
 import Queue from "../src/index.js"
 import { createClient } from "redis"
 
@@ -949,6 +950,164 @@ describe("Queue", () => {
       const result = await queue.pushAndWait({ id: 1 })
       expect(result).toBe("finally")
       expect(attempts).toBe(3)
+    })
+  })
+
+  describe("pushAndWait distributed", () => {
+    it("should resolve when a different instance processes the task", async () => {
+      queue = new Queue({ concurrency: 0 })
+      await queue.ready()
+
+      const worker = new Queue({ concurrency: 1 })
+      extraQueues.push(worker)
+      worker.process(async (payload) => ({ echo: payload.message }))
+      await worker.ready()
+
+      const result = await queue.pushAndWait({ message: "cross-instance" })
+      expect(result).toEqual({ echo: "cross-instance" })
+    })
+
+    it("should reject when a different instance fails the task", async () => {
+      queue = new Queue({ concurrency: 0 })
+      await queue.ready()
+
+      const worker = new Queue({ concurrency: 1, maxRetries: 1 })
+      extraQueues.push(worker)
+      worker.process(async () => { throw new Error("remote failure") })
+      await worker.ready()
+
+      await expect(queue.pushAndWait({ id: 1 })).rejects.toThrow("remote failure")
+    })
+
+    it("should resolve the correct task across instances with multiple in flight", async () => {
+      queue = new Queue({ concurrency: 0 })
+      await queue.ready()
+
+      const worker = new Queue({ concurrency: 3 })
+      extraQueues.push(worker)
+      worker.process(async (payload) => {
+        await new Promise((r) => setTimeout(r, 50))
+        return payload.id * 10
+      })
+      await worker.ready()
+
+      const results = await Promise.all([
+        queue.pushAndWait({ id: 1 }),
+        queue.pushAndWait({ id: 2 }),
+        queue.pushAndWait({ id: 3 }),
+      ])
+
+      expect(results).toContain(10)
+      expect(results).toContain(20)
+      expect(results).toContain(30)
+    })
+
+    it("should resolve cross-instance with grouped queues", async () => {
+      queue = new Queue({ concurrency: 0, cleanupInterval: 0 })
+      await queue.ready()
+
+      const worker = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      extraQueues.push(worker)
+      worker.process(async (payload) => `processed-${payload.id}`)
+      await worker.ready()
+
+      const result = await queue.pushAndWait({ id: "a" }, { group: "tenant-1" })
+      expect(result).toBe("processed-a")
+    })
+
+    it("should resolve cross-instance after retries succeed", async () => {
+      queue = new Queue({ concurrency: 0 })
+      await queue.ready()
+
+      let attempts = 0
+      const worker = new Queue({ concurrency: 1, maxRetries: 3 })
+      extraQueues.push(worker)
+      worker.process(async () => {
+        attempts++
+        if (attempts < 3) throw new Error("not yet")
+        return "finally"
+      })
+      await worker.ready()
+
+      const result = await queue.pushAndWait({ id: 1 })
+      expect(result).toBe("finally")
+      expect(attempts).toBe(3)
+    })
+
+    it("should respect timeout when waiting cross-instance", async () => {
+      queue = new Queue({ concurrency: 0 })
+      await queue.ready()
+
+      const worker = new Queue({ concurrency: 1 })
+      extraQueues.push(worker)
+      worker.process(async () => new Promise((r) => setTimeout(r, 5000)))
+      await worker.ready()
+
+      await expect(queue.pushAndWait({ id: 1 }, { timeout: 50 })).rejects.toThrow("pushAndWait timed out")
+    })
+  })
+
+  describe("cross-instance group discovery", () => {
+    it("should process grouped tasks pushed by another instance", async () => {
+      const worker = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      extraQueues.push(worker)
+      worker.process(async (payload) => `done-${payload.id}`)
+      await worker.ready()
+
+      queue = new Queue({ concurrency: 0, cleanupInterval: 0 })
+      await queue.ready()
+
+      await queue.push({ id: 1 }, { group: "remote-group" })
+
+      const { result } = await waitForEvent(worker, "complete")
+      expect(result).toBe("done-1")
+    })
+
+    it("should discover existing groups on startup", async () => {
+      queue = new Queue({ concurrency: 1, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      await queue.ready()
+
+      await redis.lPush("queue:groups:preexisting", JSON.stringify({
+        uuid: randomUUID(),
+        payload: { id: "pre" },
+        createdAt: Date.now(),
+        group: "preexisting",
+        attempts: 0,
+      }))
+
+      const worker = new Queue({ concurrency: 2, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      extraQueues.push(worker)
+      worker.process(async (payload) => `found-${payload.id}`)
+      await worker.ready()
+
+      const { result } = await waitForEvent(worker, "complete")
+      expect(result).toBe("found-pre")
+    })
+
+    it("should enforce per-group concurrency across instances", async () => {
+      queue = new Queue({ concurrency: 0, cleanupInterval: 0 })
+      await queue.ready()
+
+      const worker = new Queue({ concurrency: 10, groups: { concurrency: 1 }, cleanupInterval: 0 })
+      extraQueues.push(worker)
+
+      let running = 0
+      let maxRunning = 0
+      worker.process(async () => {
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        await new Promise((r) => setTimeout(r, 100))
+        running--
+      })
+      await worker.ready()
+
+      const allDone = waitForN(worker, "complete", 3)
+      await queue.push({ id: 1 }, { group: "serial" })
+      await queue.push({ id: 2 }, { group: "serial" })
+      await queue.push({ id: 3 }, { group: "serial" })
+      await allDone
+
+      expect(maxRunning).toBe(1)
     })
   })
 

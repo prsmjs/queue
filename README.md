@@ -130,6 +130,27 @@ await queue.push({ action: 'sync' }, { group: 'tenant-456' })
 
 Each tenant processes independently. One slow tenant won't block others. Total concurrent tasks across all tenants is capped by `concurrency`. When the group is conditional, just omit the option - no branching needed.
 
+Groups are fully distributed - any instance can push to any group, and any instance with available concurrency will automatically discover and process tasks for that group. New groups are announced via Redis pub/sub, and existing groups are discovered at startup.
+
+## Push and Wait
+
+Push a task and wait for its result. Works across instances - instance A can push a task that instance B processes, and the result comes back to instance A via Redis pub/sub.
+
+```js
+const result = await queue.pushAndWait({ prompt: 'summarize this' })
+```
+
+With timeout and groups:
+
+```js
+const result = await queue.pushAndWait(
+  { prompt: 'summarize this' },
+  { group: 'tenant-123', timeout: '30s' }
+)
+```
+
+Throws if the task fails (after retries are exhausted) or if the timeout is reached. Retries are transparent - if the handler fails twice then succeeds on the third attempt, `pushAndWait` resolves with the successful result.
+
 ## Events
 
 ```js
